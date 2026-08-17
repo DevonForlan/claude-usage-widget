@@ -30,8 +30,13 @@ class WindowState:
 
 
 class SettingsStore:
-    def __init__(self) -> None:
-        self._settings = QSettings(ORGANISATION, APPLICATION)
+    def __init__(self, organization: str = ORGANISATION, application: str = APPLICATION) -> None:
+        # Overridable so tests can point at an isolated registry location
+        # instead of silently overwriting the real widget's saved window
+        # state - this bit selftest.py in practice: its own persistence
+        # round-trip tests left always_on_top=False in the real location,
+        # so the actual running widget came up hidden behind other windows.
+        self._settings = QSettings(organization, application)
 
     def load(self) -> WindowState:
         pos = self._settings.value("window/position")

@@ -2,17 +2,21 @@
 
 A small always-on-top desktop widget showing Claude Code usage. Windows, Python + PySide6.
 
-> **This shows real token counts, not a quota percentage.** Claude Code does not expose your actual plan limit to local tools, so there is nothing to compute a percentage against — see [Why not a percentage](#why-not-a-percentage). The number is a genuine local measurement (summed from your own session transcripts), and the UI labels it `LOCAL` so it's never mistaken for an official reading.
-
 ## Features
 
-- Compact frameless window (250×160) that sits in a screen corner, true rounded corners (no white edge - see [Known issues fixed](#known-issues-fixed-along-the-way))
-- Total tokens used in the trailing 5 hours, summed from this machine's own Claude Code session transcripts
-- Hover the number for the exact count, split into **fresh** (new input/output/cache-writes) vs **cached** (replayed context) - see [why that split matters](#why-fresh-vs-cached)
+- Compact frameless window, true rounded corners (no white edge - see [Known issues fixed](#known-issues-fixed-along-the-way))
+- **5H** and **Weekly** rate-limit percentages, each with a reset time (local timezone) and a countdown to that reset
+- Three-tier data priority for those percentages, each clearly labelled so a reading is never mistaken for a different kind of number:
+  1. **OFFICIAL** - Anthropic's own `rate_limits` figures, captured from Claude Code's status line (see [Reading official rate limits](#reading-official-rate-limits)). Used whenever a fresh reading exists.
+  2. **ESTIMATED** - a local estimate anchored on a previously-observed rate-limit hit, used only when no official reading is available. Only ever covers a 5-hour-shaped window.
+  3. **LOCAL** - a plain token count summed from this machine's own Claude Code session transcripts, shown separately since it answers "how much was used," not "what fraction of a limit."
+- Hover the local count for the exact number, split into **fresh** (new input/output/cache-writes) vs **cached** (replayed context) - see [why that split matters](#why-fresh-vs-cached)
 - **Always on top** toggle
 - **Opacity** slider, 30%–100%
 - Drag anywhere on the window to move it
 - Remembers window position, opacity, and always-on-top between runs
+- Closing the window hides it instead of quitting, so the next wake-up skips Qt's process cold-start cost
+- A global hotkey (`Ctrl+Shift+Alt+U` by default) brings the widget to the front instantly while it's running - see [Fast wake-up](#fast-wake-up)
 
 ## Requirements
 
@@ -33,7 +37,31 @@ To launch without a console window lingering behind it, use `pythonw`:
 pythonw -m claude_usage_widget
 ```
 
-Close it with the `✕` in the top-right corner. Settings are saved on close.
+Click the `✕` in the top-right corner to hide it (see [Fast wake-up](#fast-wake-up) for how to bring it back). Settings are saved on close.
+
+## Reading official rate limits
+
+Claude Code's status line payload includes real `rate_limits.five_hour` / `rate_limits.seven_day` figures (`used_percentage`, `resets_at`) when a `statusLine` hook is configured. `claude_usage_widget/statusline_hook.py` is a small script that captures those figures to `~/.claude-usage-widget/official_rate_limits.json` on every render; wire it into your global `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "pythonw /path/to/claude-usage-widget/claude_usage_widget/statusline_hook.py"
+  }
+}
+```
+
+`OfficialRateLimitProvider` (`claude_usage_widget/rate_limits.py`) reads that capture file and is used whenever it's fresh (see `DEFAULT_MAX_AGE`); without it, the widget falls back to the estimate/local tiers described above.
+
+## Fast wake-up
+
+The widget hides rather than quits on close, so most of the time it's already running in the background. Two ways to bring it back:
+
+- **Global hotkey** - while running, the widget registers `Ctrl+Shift+Alt+U` itself (`RegisterHotKey`) and reacts to it directly, with no new process involved. This is near-instant (single-digit milliseconds measured).
+- **`launcher/`** - a small precompiled C# launcher (`Launcher.cs`, built with `csc.exe` - see the comment at the top of that file for the exact command) that either wakes an already-running widget or cold-starts one if none is running. This is what a Start Menu shortcut or an autostart-at-login shortcut should point at, since neither of those can rely on the hotkey being registered yet.
+
+  The launcher wakes the widget through a small loopback TCP listener (`WAKE_PORT` in `widget.py`) rather than calling `ShowWindow`/`SetForegroundWindow` on its native handle directly - see the comments around `WAKE_PORT` for why that distinction matters (a direct external `ShowWindow` call left Qt's own mouse-event routing desynced: painting and opacity kept working, but dragging, the close button, and the opacity slider all stopped responding).
 
 ## Tests
 
@@ -41,11 +69,11 @@ Close it with the `✕` in the top-right corner. Settings are saved on close.
 python selftest.py
 ```
 
-Builds the real widget and exercises it: `format_token_count`, `LocalTranscriptUsageProvider` against synthetic transcripts (window filtering, the mtime pre-filter, the fresh/cached split, a missing projects directory), the always-on-top flag, opacity limits, the settings round-trip, and recovery from a saved position that is no longer on any connected monitor. 30 checks, all against real code paths - the transcript tests use throwaway files in a temp directory, not this machine's own history.
+Builds the real widget and exercises it end to end - the official/estimated/local data priority chain, warning-level thresholds, the always-on-top flag, opacity limits, the settings round-trip, recovery from a saved position that is no longer on any connected monitor, and that closing hides rather than tears down the widget. All against real code paths - the transcript tests use throwaway files in a temp directory, not this machine's own history.
 
-## Why not a percentage
+## Why the local count exists at all
 
-This was researched properly rather than guessed at - each row below was directly verified, not inferred from memory:
+Before official rate limits were confirmed reachable from the status line, no local source exposed anything shaped like a percentage. This was researched properly rather than guessed at - each row below was directly verified, not inferred from memory:
 
 | Source | Result |
 |---|---|
@@ -86,4 +114,4 @@ Returning `None` from `fetch()` is supported and renders as "Usage data unavaila
 
 ## Not in V1
 
-Deliberately out of scope: installer, auto-start at login, notifications/alerts, tray icon, multi-window.
+Deliberately out of scope: installer, notifications/alerts, tray icon, multi-window.

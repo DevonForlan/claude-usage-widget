@@ -11,13 +11,16 @@ Claude Code history existing or having any particular shape.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from claude_usage_widget.exhaustion import (
@@ -27,6 +30,13 @@ from claude_usage_widget.exhaustion import (
     ExhaustionStore,
     confidence_for_sample_count,
     scan_and_record,
+)
+from claude_usage_widget.rate_limits import (
+    OfficialRateLimitProvider,
+    OfficialRateLimits,
+    RateLimitWindow,
+    format_reset_time,
+    warning_level,
 )
 from claude_usage_widget.settings_store import (
     APPLICATION,
@@ -38,6 +48,18 @@ from claude_usage_widget.usage_source import LocalTranscriptUsageProvider, MockU
 from claude_usage_widget.widget import UsageWidget, format_token_count
 
 failures: list[str] = []
+
+# A distinct QSettings application name for every SettingsStore this suite
+# creates - persistence-round-trip tests below deliberately write real
+# on/off-screen, opacity, and always-on-top values, and doing that under the
+# real APPLICATION name previously left the actual widget's saved window
+# state clobbered (e.g. always_on_top=False), so the real app came up
+# hidden behind other windows the next time it launched.
+TEST_APPLICATION = f"{APPLICATION}-selftest"
+
+
+def _test_store() -> SettingsStore:
+    return SettingsStore(organization=ORGANISATION, application=TEST_APPLICATION)
 
 
 def check(label: str, condition: bool, detail: str = "") -> None:
@@ -330,12 +352,117 @@ def test_format_token_count() -> None:
           f"got {format_token_count(1_284_300)!r}")
 
 
+def test_warning_levels() -> None:
+    print("warning_level thresholds")
+    check("69.9 -> normal", warning_level(69.9) == "normal")
+    check("70 -> elevated (boundary)", warning_level(70) == "elevated")
+    check("84.9 -> elevated", warning_level(84.9) == "elevated")
+    check("85 -> high (boundary)", warning_level(85) == "high")
+    check("94.9 -> high", warning_level(94.9) == "high")
+    check("95 -> critical (boundary)", warning_level(95) == "critical")
+    check("100 -> critical", warning_level(100) == "critical")
+    check("0 -> normal", warning_level(0) == "normal")
+
+
+def test_rate_limit_window_rounding_and_reset() -> None:
+    print("RateLimitWindow rounding + reset-time formatting")
+    window = RateLimitWindow(
+        used_percentage=57.99999999999999,
+        resets_at=datetime(2026, 8, 17, 5, 10, 0, tzinfo=timezone.utc),  # 13:10 Taipei (UTC+8)
+    )
+    check("57.99999999999999 rounds to 58, not truncates to 57",
+          window.rounded_percentage == 58, f"got {window.rounded_percentage}")
+    check("level derived from used_percentage", window.level == "normal", f"got {window.level}")
+    check("reset time converted to Asia/Taipei (UTC+8), HH:MM only",
+          window.reset_label() == "13:10", f"got {window.reset_label()!r}")
+    check("format_reset_time matches the same conversion",
+          format_reset_time(window.resets_at) == "13:10")
+
+    print("RateLimitWindow.time_until_reset")
+    reference = datetime(2026, 8, 17, 10, 0, 0, tzinfo=timezone.utc)
+    hours_and_minutes = RateLimitWindow(used_percentage=0, resets_at=reference + timedelta(hours=2, minutes=13))
+    check("hours + minutes format", hours_and_minutes.time_until_reset(now=reference) == "2h 13m",
+          f"got {hours_and_minutes.time_until_reset(now=reference)!r}")
+    minutes_only = RateLimitWindow(used_percentage=0, resets_at=reference + timedelta(minutes=45))
+    check("minutes-only format when under an hour", minutes_only.time_until_reset(now=reference) == "45m",
+          f"got {minutes_only.time_until_reset(now=reference)!r}")
+    already_passed = RateLimitWindow(used_percentage=0, resets_at=reference - timedelta(minutes=5))
+    check("a reset time already in the past reads 'due now'",
+          already_passed.time_until_reset(now=reference) == "due now",
+          f"got {already_passed.time_until_reset(now=reference)!r}")
+
+
+def test_official_rate_limit_provider() -> None:
+    print("OfficialRateLimitProvider (capture file parsing)")
+
+    tmp = Path(tempfile.mkdtemp(prefix="usage_widget_selftest_official_"))
+    try:
+        capture_path = tmp / "official_rate_limits.json"
+
+        missing_provider = OfficialRateLimitProvider(capture_path=capture_path)
+        check("missing capture file -> None", missing_provider.fetch() is None)
+
+        capture_path.write_text("not json", encoding="utf-8")
+        check("malformed JSON -> None", missing_provider.fetch() is None)
+
+        fresh_payload = {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 57.99999999999999, "resets_at": 1786943400},
+                "seven_day": {"used_percentage": 89, "resets_at": 1786942800},
+            },
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+        capture_path.write_text(json.dumps(fresh_payload), encoding="utf-8")
+        result = missing_provider.fetch()
+        check("fresh, well-formed capture parses", result is not None)
+        if result is not None:
+            check("five_hour used_percentage matches source, rounds to 58",
+                  result.five_hour.rounded_percentage == 58, f"got {result.five_hour.rounded_percentage}")
+            check("seven_day used_percentage is 89",
+                  result.seven_day.rounded_percentage == 89, f"got {result.seven_day.rounded_percentage}")
+            check("overall_percentage is max(five_hour, seven_day), not an average",
+                  result.overall_percentage == 89, f"got {result.overall_percentage}")
+            check("overall_level reflects the higher (weekly) figure",
+                  result.overall_level == "high", f"got {result.overall_level}")
+
+        stale_payload = dict(fresh_payload)
+        stale_payload["captured_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=45)
+        ).isoformat()
+        capture_path.write_text(json.dumps(stale_payload), encoding="utf-8")
+        stale_provider = OfficialRateLimitProvider(capture_path=capture_path, max_age=timedelta(minutes=30))
+        check("data older than max_age is treated as unavailable, not shown as current",
+              stale_provider.fetch() is None)
+
+        # A BOM prepended by some invocation paths (observed via a PowerShell
+        # pipe into a native exe) must not break parsing.
+        bom_path = tmp / "with_bom.json"
+        bom_path.write_bytes(b"\xef\xbb\xbf" + json.dumps(fresh_payload).encode("utf-8"))
+        bom_provider = OfficialRateLimitProvider(capture_path=bom_path)
+        check("leading UTF-8 BOM is tolerated", bom_provider.fetch() is not None)
+
+        incomplete_payload = {
+            "rate_limits": {"five_hour": {"used_percentage": 10, "resets_at": 123}},
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+        incomplete_path = tmp / "incomplete.json"
+        incomplete_path.write_text(json.dumps(incomplete_payload), encoding="utf-8")
+        incomplete_provider = OfficialRateLimitProvider(capture_path=incomplete_path)
+        check("missing seven_day bucket -> None rather than a half-filled reading",
+              incomplete_provider.fetch() is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setOrganizationName(ORGANISATION)
     app.setApplicationName(APPLICATION)
 
     test_format_token_count()
+    test_warning_levels()
+    test_rate_limit_window_rounding_and_reset()
+    test_official_rate_limit_provider()
     test_local_transcript_provider()
     test_fresh_vs_cached_split()
     test_exhaustion_detection_and_window_stats()
@@ -349,79 +476,148 @@ def main() -> int:
     check("total_tokens non-negative", snap.total_tokens >= 0, f"got {snap.total_tokens}")
     check("badge marks mock data", snap.badge_text == "MOCK")
 
-    print("widget")
-    store = SettingsStore()
+    class _FakeOfficialProvider:
+        """Test double for OfficialRateLimitProvider - avoids depending on
+        (or being thrown off by) this machine's real, live capture file."""
+        name = "fake_official"
+
+        def __init__(self) -> None:
+            self.result: Optional[OfficialRateLimits] = None
+
+        def fetch(self) -> Optional[OfficialRateLimits]:
+            return self.result
+
+    print("widget - no official data, no exhaustion history")
+    store = _test_store()
     # Isolated exhaustion store + a non-existent projects_dir - this widget
     # instance must not depend on (or mutate) this machine's real exhaustion
     # history, and must not trigger a real scan against ~/.claude/projects.
     widget_scratch = Path(tempfile.mkdtemp(prefix="usage_widget_selftest_widget_"))
     widget_exhaustion_store = ExhaustionStore(path=widget_scratch / "store.json")
+    fake_official = _FakeOfficialProvider()
     widget = UsageWidget(
         provider=provider,
         store=store,
         exhaustion_store=widget_exhaustion_store,
         projects_dir=widget_scratch / "does-not-exist",
+        official_provider=fake_official,
     )
     widget.show()
+    # The constructor's initial refresh() is deferred via QTimer.singleShot(0, ...)
+    # so the window can appear before that (real file I/O) work finishes -
+    # a real (not zero-length) wait is needed so the singleShot timer
+    # actually gets dispatched before checking its result.
+    QTest.qWait(50)
 
     check("window is visible", widget.isVisible())
     check("compact size", widget.width() <= 320 and widget.height() <= 320,
           f"got {widget.width()}x{widget.height()}")
-    check("token label shows formatted count",
-          widget._used_label.text() == format_token_count(snap.total_tokens),
-          f"got {widget._used_label.text()!r}")
-    check("exact count available on hover",
-          f"{snap.total_tokens:,} tokens total" in widget._used_label.toolTip(),
-          f"got {widget._used_label.toolTip()!r}")
+    # MockUsageProvider's count is a function of elapsed wall-clock time, so
+    # comparing against the earlier standalone `snap` fetched above would be
+    # flaky now that the widget's own fetch happens after a real qWait delay
+    # rather than back-to-back with it. Check self-consistency instead: pull
+    # the exact figure out of the tooltip itself and confirm the rounded
+    # label matches *that*, rather than a separately-timed reading.
+    tooltip = widget._local_label.toolTip()
+    tooltip_match = re.search(r"([\d,]+) tokens total", tooltip)
+    check("exact count available on hover", tooltip_match is not None, f"got {tooltip!r}")
+    if tooltip_match:
+        exact_total = int(tooltip_match.group(1).replace(",", ""))
+        check("local line shows the same count, just rounded/compacted",
+              widget._local_label.text() == f"Local: {format_token_count(exact_total)} tokens",
+              f"label={widget._local_label.text()!r} tooltip_total={exact_total}")
     check("hover breaks down fresh vs cached tokens",
-          "fresh" in widget._used_label.toolTip() and "cached" in widget._used_label.toolTip())
-    check("detail line mentions the headline", snap.headline in widget._detail_label.text(),
-          f"got {widget._detail_label.text()!r}")
-    check("data badge shown with provider's text",
-          widget._data_badge.isVisible() and widget._data_badge.text() == "MOCK")
-    check("estimated section shows -- with no exhaustion history",
-          widget._estimated_pct_label.text() == "--",
-          f"got {widget._estimated_pct_label.text()!r}")
-    check("estimated confidence line says no event recorded",
-          "no exhaustion event" in widget._estimated_confidence_label.text().lower(),
-          f"got {widget._estimated_confidence_label.text()!r}")
+          "fresh" in tooltip and "cached" in tooltip)
+    check("5H shows -- with no official data and no exhaustion history",
+          widget._five_hour_pct_label.text() == "--",
+          f"got {widget._five_hour_pct_label.text()!r}")
+    check("5H badge hidden when there is nothing to attribute",
+          not widget._five_hour_badge.isVisible())
+    check("Weekly shows -- (no official data, and estimate can't cover this window)",
+          widget._seven_day_pct_label.text() == "--",
+          f"got {widget._seven_day_pct_label.text()!r}")
 
-    print("estimated section once an exhaustion event exists")
+    print("widget - official rate_limits available")
+    # Offsets from "now" rather than a fixed calendar date, so the countdown
+    # ("Xh Ym left") this test checks for stays correct no matter when the
+    # suite actually runs.
+    now = datetime.now(timezone.utc)
+    five_hour_reset_at = now + timedelta(hours=2, minutes=13)
+    seven_day_reset_at = now + timedelta(hours=1, minutes=3)
+    fake_official.result = OfficialRateLimits(
+        five_hour=RateLimitWindow(used_percentage=57.99999999999999, resets_at=five_hour_reset_at),
+        seven_day=RateLimitWindow(used_percentage=89, resets_at=seven_day_reset_at),
+        captured_at=now,
+    )
+    widget.refresh()
+    check("5H shows rounded official percentage",
+          widget._five_hour_pct_label.text() == "58%", f"got {widget._five_hour_pct_label.text()!r}")
+    check("5H reset label shows Taipei clock time",
+          f"Reset {format_reset_time(five_hour_reset_at)}" in widget._five_hour_reset_label.text(),
+          f"got {widget._five_hour_reset_label.text()!r}")
+    check("5H reset label also shows a countdown to reset",
+          "left" in widget._five_hour_reset_label.text(),
+          f"got {widget._five_hour_reset_label.text()!r}")
+    check("5H badge says OFFICIAL",
+          widget._five_hour_badge.isVisible() and widget._five_hour_badge.text() == "OFFICIAL")
+    check("Weekly shows 89%", widget._seven_day_pct_label.text() == "89%",
+          f"got {widget._seven_day_pct_label.text()!r}")
+    check("Weekly reset label shows Taipei clock time",
+          f"Reset {format_reset_time(seven_day_reset_at)}" in widget._seven_day_reset_label.text(),
+          f"got {widget._seven_day_reset_label.text()!r}")
+    check("Weekly reset label also shows a countdown to reset",
+          "left" in widget._seven_day_reset_label.text(),
+          f"got {widget._seven_day_reset_label.text()!r}")
+    check("Weekly badge says OFFICIAL",
+          widget._seven_day_badge.isVisible() and widget._seven_day_badge.text() == "OFFICIAL")
+    check("estimated-only 'Estimated Used' presentation does not appear once official data exists",
+          "~" not in widget._five_hour_pct_label.text() and "~" not in widget._seven_day_pct_label.text())
+
+    print("widget - falls back to historical estimate once an exhaustion event exists and official is gone")
+    fake_official.result = None
     widget_exhaustion_store.add_event(ExhaustionEvent(
         timestamp=datetime.now(timezone.utc), window_hours=5.0,
         input_tokens=10_000_000, output_tokens=0,
         cache_creation_tokens=0, cache_read_tokens=0, message_count=1, session_count=1,
     ))
-    # Drives _render_estimated directly with a fixed value rather than going
-    # through refresh()/the live time-based MockUsageProvider, so the 50%
-    # expected below can't be thrown off by wall-clock timing.
-    widget._render_estimated(widget._quota_model.estimate(5_000_000))
-    check("estimated pct becomes ~50% (current is half the anchor)",
-          widget._estimated_pct_label.text() == "~50%",
-          f"got {widget._estimated_pct_label.text()!r}")
-    check("estimated detail shows current + anchor",
-          "Anchor" in widget._estimated_detail_label.text(),
-          f"got {widget._estimated_detail_label.text()!r}")
-    check("estimated confidence shows Low / Samples: 1",
-          widget._estimated_confidence_label.text() == "Confidence: Low · Samples: 1",
-          f"got {widget._estimated_confidence_label.text()!r}")
+    # Drive the fallback render directly with a fixed value rather than
+    # through refresh()'s live time-based MockUsageProvider fresh_tokens, so
+    # the 50% expected below can't be thrown off by wall-clock timing.
+    widget._render_estimate_fallback(widget._quota_model.estimate(5_000_000))
+    check("5H falls back to ~50% (current is half the anchor)",
+          widget._five_hour_pct_label.text() == "~50%",
+          f"got {widget._five_hour_pct_label.text()!r}")
+    check("5H badge says ESTIMATED, not OFFICIAL, once official data is gone",
+          widget._five_hour_badge.isVisible() and widget._five_hour_badge.text() == "ESTIMATED")
+    check("5H detail shows the anchor",
+          "Anchor" in widget._five_hour_reset_label.text(),
+          f"got {widget._five_hour_reset_label.text()!r}")
+    check("Weekly has no historical-estimate equivalent, so it stays --",
+          widget._seven_day_pct_label.text() == "--",
+          f"got {widget._seven_day_pct_label.text()!r}")
+    check("Weekly badge hidden in the fallback state",
+          not widget._seven_day_badge.isVisible())
     shutil.rmtree(widget_scratch, ignore_errors=True)
 
-    print("refresh() with no data available")
+    print("refresh() with no local data and no official data available")
     class _EmptyProvider:
         name = "empty"
         def fetch(self):
             return None
     widget2 = UsageWidget(
         provider=_EmptyProvider(),
-        store=SettingsStore(),
+        store=_test_store(),
         exhaustion_store=ExhaustionStore(path=Path(tempfile.mkdtemp()) / "store.json"),
         projects_dir=Path(tempfile.mkdtemp()) / "does-not-exist",
+        official_provider=_FakeOfficialProvider(),
     )
     widget2.show()
-    check("shows placeholder when provider returns None",
-          widget2._used_label.text() == "--")
-    check("badge hidden when no data", not widget2._data_badge.isVisible())
+    QTest.qWait(50)  # let the deferred initial refresh() run
+    check("shows placeholder when local provider returns None",
+          widget2._local_label.text() == "Local: unavailable",
+          f"got {widget2._local_label.text()!r}")
+    check("5H shows -- when neither official nor estimate is available",
+          widget2._five_hour_pct_label.text() == "--")
     widget2.close()
 
     print("always-on-top toggle")
@@ -451,7 +647,7 @@ def main() -> int:
     widget._on_top_box.setChecked(True)
     widget.close()
 
-    reloaded = SettingsStore().load()
+    reloaded = _test_store().load()
     check("position persisted", reloaded.position == target,
           f"got {reloaded.position}")
     check("opacity persisted", reloaded.opacity_pct == 72,
@@ -459,10 +655,20 @@ def main() -> int:
     check("always-on-top persisted", reloaded.always_on_top is True,
           f"got {reloaded.always_on_top}")
 
+    print("close hides rather than quits (this is what makes reopening fast)")
+    check("widget is hidden, not destroyed, after close()", not widget.isVisible())
+    check("process is still alive - object wasn't torn down", widget is not None)
+    widget.show()
+    QTest.qWait(50)  # let showEvent's deferred refresh run
+    check("shows again without reconstruction", widget.isVisible())
+    check("still has real data after being re-shown (not reset to placeholders)",
+          widget._local_label.text() != "Loading…",
+          f"got {widget._local_label.text()!r}")
+
     print("off-screen position is rejected")
     store.save(WindowState(position=QPoint(-9000, -9000), opacity_pct=80,
                            always_on_top=False))
-    recovered = UsageWidget(provider=provider, store=SettingsStore())
+    recovered = UsageWidget(provider=provider, store=_test_store())
     recovered.show()
     check("moved back on-screen", recovered._is_on_screen(recovered.pos()),
           f"landed at {recovered.pos()}")
