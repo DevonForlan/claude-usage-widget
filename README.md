@@ -14,7 +14,7 @@ A small always-on-top desktop widget showing Claude Code usage. Windows, Python 
 - **Always on top** toggle
 - **Opacity** slider, 30%–100%
 - Drag anywhere on the window to move it
-- Remembers window position, opacity, and always-on-top between runs
+- Remembers window position, opacity, and always-on-top between runs (a full process restart) - waking an already-running window (hotkey or launcher, see [Fast wake-up](#fast-wake-up)) always snaps it to the top-right corner instead, on purpose
 - Closing the window hides it instead of quitting, so the next wake-up skips Qt's process cold-start cost
 - A global hotkey (`Ctrl+Shift+Alt+U` by default) brings the widget to the front instantly while it's running - see [Fast wake-up](#fast-wake-up)
 
@@ -56,7 +56,7 @@ Claude Code's status line payload includes real `rate_limits.five_hour` / `rate_
 
 ## Fast wake-up
 
-The widget hides rather than quits on close, so most of the time it's already running in the background. Two ways to bring it back:
+The widget hides rather than quits on close, so most of the time it's already running in the background. Two ways to bring it back - both unconditionally move the window to the screen's top-right corner first, rather than only when it's drifted off-screen: a window left running for days can end up dragged onto a monitor that gets unplugged later, with no restart ever happening to re-trigger the normal startup on-screen check, so waking it up needs its own always-know-where-to-look guarantee rather than relying on that:
 
 - **Global hotkey** - while running, the widget registers `Ctrl+Shift+Alt+U` itself (`RegisterHotKey`) and reacts to it directly, with no new process involved. This is near-instant (single-digit milliseconds measured).
 - **`launcher/`** - a small precompiled C# launcher (`Launcher.cs`, built with `csc.exe` - see the comment at the top of that file for the exact command) that either wakes an already-running widget or cold-starts one if none is running. This is what a Start Menu shortcut or an autostart-at-login shortcut should point at, since neither of those can rely on the hotkey being registered yet.

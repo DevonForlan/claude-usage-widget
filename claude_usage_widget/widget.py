@@ -548,6 +548,16 @@ class UsageWidget(QWidget):
         ctypes.windll.user32.RegisterHotKey(int(self.winId()), HOTKEY_ID, modifiers, WIN_VK_U)
 
     def _on_global_hotkey(self) -> None:
+        # Deliberately unconditional, not just an off-screen fallback: every
+        # wake-up (hotkey or the launcher's TCP push below) snaps back to
+        # the same top-right corner regardless of where the window was last
+        # left, including a plain on-screen drag - a fixed, predictable spot
+        # you can find it at every time was asked for over "remember
+        # wherever I last dragged it" for this particular action. Position
+        # is still remembered and restored across a full process restart
+        # (see _apply_state(), used once at startup) - this only affects
+        # waking an already-running window back up.
+        self._move_to_default_corner()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -558,6 +568,7 @@ class UsageWidget(QWidget):
             sock = self._wake_server.nextPendingConnection()
             sock.disconnectFromHost()
             sock.deleteLater()
+        self._move_to_default_corner()
         self.show()
         self.raise_()
         self.activateWindow()
