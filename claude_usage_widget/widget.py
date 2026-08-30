@@ -3,13 +3,17 @@
 Data priority for the two big percentages (5H / Weekly):
 
 1. OfficialRateLimitProvider - Anthropic's own rate_limits, captured from
-   Claude Code's status line (see rate_limits.py). Used whenever a fresh
-   reading exists.
+   Claude Code's status line (see rate_limits.py). Used whenever a reading
+   has EVER been captured - it is not discarded just because the statusLine
+   hook hasn't rendered again recently. Each window (5H / Weekly) is then
+   rendered independently as LIVE, LAST KNOWN, or AWAITING REFRESH depending
+   on whether its own `resets_at` has passed - see rate_limits.py.
 2. HistoricalEstimateProvider (EstimatedQuotaModel, exhaustion.py) - only
-   consulted when (1) is unavailable. It only ever covers a 5-hour-shaped
-   window (the exhaustion anchor's own scope), so it fills the 5H slot and
-   leaves Weekly blank rather than inventing a number that source cannot
-   support.
+   consulted when (1) has NEVER produced a reading (statusLine hook never
+   configured, or its capture file has never successfully parsed). It only
+   ever covers a 5-hour-shaped window (the exhaustion anchor's own scope), so
+   it fills the 5H slot and leaves Weekly blank rather than inventing a
+   number that source cannot support.
 3. LocalTranscriptUsageProvider - never a percentage source; always shown
    separately as a plain token count ("Local: 13.70M tokens"), since it
    answers a different question (how much was used) than the two above
@@ -19,6 +23,7 @@ Data priority for the two big percentages (5H / Weekly):
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -37,7 +42,15 @@ from PySide6.QtWidgets import (
 )
 
 from .exhaustion import EstimatedQuota, EstimatedQuotaModel, ExhaustionStore, scan_and_record
-from .rate_limits import OfficialRateLimitProvider, OfficialRateLimits, warning_level
+from .rate_limits import (
+    STATUS_AWAITING_REFRESH,
+    STATUS_LIVE,
+    OfficialRateLimitProvider,
+    OfficialRateLimits,
+    RateLimitWindow,
+    format_age,
+    warning_level,
+)
 from .settings_store import OPACITY_MAX, OPACITY_MIN, SettingsStore, WindowState
 from .usage_source import UsageProvider, UsageSnapshot
 
@@ -110,11 +123,15 @@ WAKE_PORT = 51823
 # Warning-level -> text colour for the big percentage numbers. Each number is
 # coloured by ITS OWN value, independently of the other window - a calm 5H
 # reading should still look calm even if the weekly figure is critical.
+# "awaiting" is not a usage-pressure level (no current percentage exists to
+# judge) - it gets a neutral grey rather than borrowing "normal"'s green,
+# which would misleadingly read as "usage is fine" rather than "unknown".
 _LEVEL_COLORS = {
     "normal": "#3fb950",
     "elevated": "#d29922",
     "high": "#db6d28",
     "critical": "#f85149",
+    "awaiting": "#8b949e",
 }
 
 STYLE = """
@@ -126,14 +143,25 @@ STYLE = """
 QLabel { color: #c9d1d9; }
 #titleLabel { color: #8b949e; font-size: 11px; font-weight: 600; }
 #sourceBadge {
-    color: #3fb950;
     border: 1px solid #3fb950;
     border-radius: 4px;
     padding: 0px 4px;
     font-size: 9px;
     font-weight: 600;
 }
-#sourceBadge[estimated="true"] {
+#sourceBadge[kind="live"] {
+    color: #3fb950;
+    border-color: #3fb950;
+}
+#sourceBadge[kind="last_known"] {
+    color: #58a6ff;
+    border-color: #58a6ff;
+}
+#sourceBadge[kind="awaiting"] {
+    color: #8b949e;
+    border-color: #8b949e;
+}
+#sourceBadge[kind="estimated"] {
     color: #a371f7;
     border-color: #a371f7;
 }
@@ -398,27 +426,54 @@ class UsageWidget(QWidget):
         self._render_local(local_snapshot)
 
     def _render_official(self, official: OfficialRateLimits) -> None:
-        self._set_window_section(
+        now = datetime.now(timezone.utc)
+        self._render_window(
             self._five_hour_badge, self._five_hour_pct_label, self._five_hour_reset_label,
-            pct_text=f"{official.five_hour.rounded_percentage}%",
-            level=official.five_hour.level,
-            reset_text=(
-                f"Reset {official.five_hour.reset_label()} "
-                f"· {official.five_hour.time_until_reset()} left"
-            ),
-            badge_text="OFFICIAL",
-            estimated=False,
+            window=official.five_hour, captured_at=official.captured_at, now=now,
         )
-        self._set_window_section(
+        self._render_window(
             self._seven_day_badge, self._seven_day_pct_label, self._seven_day_reset_label,
-            pct_text=f"{official.seven_day.rounded_percentage}%",
-            level=official.seven_day.level,
-            reset_text=(
-                f"Reset {official.seven_day.reset_label()} "
-                f"· {official.seven_day.time_until_reset()} left"
-            ),
-            badge_text="OFFICIAL",
-            estimated=False,
+            window=official.seven_day, captured_at=official.captured_at, now=now,
+        )
+
+    def _render_window(
+        self,
+        badge: QLabel,
+        pct_label: QLabel,
+        reset_label: QLabel,
+        *,
+        window: RateLimitWindow,
+        captured_at: datetime,
+        now: datetime,
+    ) -> None:
+        status = window.status(captured_at, now)
+        if status == STATUS_AWAITING_REFRESH:
+            # This window has already reset since the last capture - the old
+            # percentage belongs to a window that is over, and showing it (or
+            # a fake 0%) would misrepresent the new window's actual usage,
+            # which is unknown until the next statusLine render.
+            self._set_window_section(
+                badge, pct_label, reset_label,
+                pct_text="AWAITING REFRESH", level="awaiting",
+                reset_text="New window started",
+                badge_text="AWAITING REFRESH", kind="awaiting",
+            )
+            return
+
+        if status == STATUS_LIVE:
+            badge_text, kind = "OFFICIAL · LIVE", "live"
+            reset_text = f"Reset {window.reset_label()} · {window.time_until_reset(now=now)} left"
+        else:
+            badge_text, kind = "OFFICIAL · LAST KNOWN", "last_known"
+            reset_text = f"Reset {window.reset_label()} · Updated {format_age(captured_at, now)}"
+
+        self._set_window_section(
+            badge, pct_label, reset_label,
+            pct_text=f"{window.rounded_percentage}%",
+            level=window.level,
+            reset_text=reset_text,
+            badge_text=badge_text,
+            kind=kind,
         )
 
     def _render_estimate_fallback(self, estimate: EstimatedQuota) -> None:
@@ -426,7 +481,7 @@ class UsageWidget(QWidget):
             self._set_window_section(
                 self._five_hour_badge, self._five_hour_pct_label, self._five_hour_reset_label,
                 pct_text="--", level="normal", reset_text="No official data or estimate yet",
-                badge_text="", estimated=False,
+                badge_text="", kind="none",
             )
         else:
             pct = estimate.estimated_used_pct or 0.0
@@ -439,7 +494,7 @@ class UsageWidget(QWidget):
                     f"{estimate.confidence.title()} confidence ({estimate.sample_count} samples)"
                 ),
                 badge_text="ESTIMATED",
-                estimated=True,
+                kind="estimated",
             )
         # No 7-day-shaped local signal exists (the exhaustion anchor is
         # scoped to a 5-hour window) - showing a fabricated weekly estimate
@@ -447,7 +502,7 @@ class UsageWidget(QWidget):
         self._set_window_section(
             self._seven_day_badge, self._seven_day_pct_label, self._seven_day_reset_label,
             pct_text="--", level="normal", reset_text="Unavailable without official data",
-            badge_text="", estimated=False,
+            badge_text="", kind="none",
         )
 
     def _set_window_section(
@@ -460,17 +515,24 @@ class UsageWidget(QWidget):
         level: str,
         reset_text: str,
         badge_text: str,
-        estimated: bool,
+        kind: str,
     ) -> None:
         pct_label.setText(pct_text)
         color = _LEVEL_COLORS.get(level, _LEVEL_COLORS["normal"])
-        pct_label.setStyleSheet(f"color: {color};")
-        pct_label.setToolTip(f"{level.title()} usage level")
+        # Long status text ("AWAITING REFRESH") needs a smaller size than the
+        # normal 2-4 character percentage to avoid overflowing the fixed-width
+        # window.
+        font_size = 26 if len(pct_text) <= 5 else 13
+        pct_label.setStyleSheet(f"color: {color}; font-size: {font_size}px;")
+        pct_label.setToolTip(
+            "New window started - waiting for the next official reading"
+            if level == "awaiting" else f"{level.title()} usage level"
+        )
         reset_label.setText(reset_text)
 
         badge.setText(badge_text)
         badge.setVisible(bool(badge_text))
-        badge.setProperty("estimated", "true" if estimated else "false")
+        badge.setProperty("kind", kind)
         badge.style().unpolish(badge)
         badge.style().polish(badge)
 

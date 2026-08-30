@@ -17,8 +17,26 @@ against Anthropic's actual limit - which is why LocalTranscriptUsageProvider
 (usage_source.py) and the historical exhaustion anchor (exhaustion.py) both
 stay in place: the former as a genuine local token count shown alongside
 (not instead of) the official numbers, the latter as a fallback estimate for
-when the official reading is unavailable (Claude Code closed, status line
-hasn't rendered recently, capture file missing/stale).
+when NO official reading has EVER been captured (Claude Code never
+configured with the statusLine hook, or the capture file has never
+successfully parsed).
+
+REVISED (2026-08-30): a fixed "discard the whole reading after N minutes
+without a fresh statusLine render" policy (the old DEFAULT_MAX_AGE) produced
+a confusing UI: after ~30 quiet minutes the last known official numbers
+vanished and the display fell back to the historical estimate, which - since
+local activity was also quiet - showed a misleading "ESTIMATED ~0%" that
+looked like a real, current reading of zero usage. The fix: the last
+successfully captured five_hour/seven_day reading is now kept indefinitely
+(see OfficialRateLimitProvider.fetch(), which no longer rejects a record for
+being old), and each window's own `resets_at` - not a fixed clock timeout -
+decides whether that reading still describes the CURRENT window. A reading
+is still valid to show as-is for as long as `resets_at` hasn't passed yet,
+however long ago it was captured; once `resets_at` passes, that number
+belongs to a window that is already over, so it is replaced by an explicit
+"awaiting refresh" state rather than either the stale percentage or a fake
+zero. five_hour and seven_day reset at different times, so this is decided
+per window, not for the reading as a whole.
 """
 
 from __future__ import annotations
@@ -31,10 +49,16 @@ from typing import Optional
 
 DEFAULT_CAPTURE_PATH = Path.home() / ".claude-usage-widget" / "official_rate_limits.json"
 
-# The statusLine hook only fires when Claude Code re-renders it (a prompt
-# sent, a tool call, etc.) - not on a timer of its own. Data older than this
-# is treated as unavailable rather than shown as if it were still current.
-DEFAULT_MAX_AGE = timedelta(minutes=30)
+# Below this age, a reading is shown as "LIVE" (statusLine is actively
+# rendering); above it - but still before its window's own resets_at - it is
+# shown as "LAST KNOWN" (still correct, just not from a moment ago). This is
+# purely a display distinction, not a validity cutoff: see module docstring.
+LIVE_THRESHOLD = timedelta(minutes=2)
+
+# Per-window status returned by window_status().
+STATUS_LIVE = "live"
+STATUS_LAST_KNOWN = "last_known"
+STATUS_AWAITING_REFRESH = "awaiting_refresh"
 
 # A fixed UTC+8 offset rather than zoneinfo.ZoneInfo("Asia/Taipei"): Windows
 # Python has no bundled IANA tzdata (ZoneInfo raises ZoneInfoNotFoundError
@@ -67,6 +91,20 @@ def format_reset_time(dt: datetime, tz: timezone = TAIPEI) -> str:
     from an aware UTC datetime. No timestamp, no timezone suffix - the
     widget's audience is one person in one timezone."""
     return dt.astimezone(tz).strftime("%H:%M")
+
+
+def format_age(captured_at: datetime, now: Optional[datetime] = None) -> str:
+    """'30m ago' / '2h 13m ago' - elapsed time since captured_at. `now` is
+    injectable for deterministic testing; defaults to the real current time."""
+    now = now or datetime.now(timezone.utc)
+    elapsed = (now - captured_at).total_seconds()
+    if elapsed < 60:
+        return "just now"
+    minutes_total = int(elapsed // 60)
+    hours, minutes = divmod(minutes_total, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m ago"
+    return f"{minutes}m ago"
 
 
 @dataclass(frozen=True)
@@ -103,10 +141,24 @@ class RateLimitWindow:
             return f"{hours}h {minutes}m"
         return f"{minutes}m"
 
+    def status(self, captured_at: datetime, now: Optional[datetime] = None) -> str:
+        """Whether this window's reading (captured at `captured_at`) still
+        describes the CURRENT window, per the per-window resets_at rule
+        described in this module's docstring - not a fixed age cutoff."""
+        now = now or datetime.now(timezone.utc)
+        if now >= self.resets_at:
+            return STATUS_AWAITING_REFRESH
+        if now - captured_at <= LIVE_THRESHOLD:
+            return STATUS_LIVE
+        return STATUS_LAST_KNOWN
+
 
 @dataclass(frozen=True)
 class OfficialRateLimits:
-    """A complete, fresh reading of both official rate-limit windows."""
+    """The last successfully captured reading of both official rate-limit
+    windows. Despite the name, this may not be "fresh" - see module
+    docstring - each window's own `status()` decides whether it still
+    describes the current window."""
 
     five_hour: RateLimitWindow
     seven_day: RateLimitWindow
@@ -123,21 +175,27 @@ class OfficialRateLimits:
     def overall_level(self) -> str:
         return warning_level(self.overall_percentage)
 
+    def five_hour_status(self, now: Optional[datetime] = None) -> str:
+        return self.five_hour.status(self.captured_at, now)
+
+    def seven_day_status(self, now: Optional[datetime] = None) -> str:
+        return self.seven_day.status(self.captured_at, now)
+
 
 class OfficialRateLimitProvider:
     """Reads the rate_limits object Claude Code's own status line receives,
     captured to a stable local file by statusline_hook.py. This is the
-    genuine article - Anthropic's own numbers - not a local estimate."""
+    genuine article - Anthropic's own numbers - not a local estimate.
+
+    Returns the last successfully captured reading regardless of its age -
+    there is no age-based rejection here (see module docstring for why).
+    Callers decide per-window validity via OfficialRateLimits.five_hour_status()
+    / seven_day_status()."""
 
     name = "official_rate_limits"
 
-    def __init__(
-        self,
-        capture_path: Optional[Path] = None,
-        max_age: timedelta = DEFAULT_MAX_AGE,
-    ) -> None:
+    def __init__(self, capture_path: Optional[Path] = None) -> None:
         self._capture_path = capture_path or DEFAULT_CAPTURE_PATH
-        self._max_age = max_age
 
     def fetch(self) -> Optional[OfficialRateLimits]:
         try:
@@ -151,8 +209,6 @@ class OfficialRateLimitProvider:
 
         captured_at = _parse_iso(record.get("captured_at"))
         if captured_at is None:
-            return None
-        if datetime.now(timezone.utc) - captured_at > self._max_age:
             return None
 
         rate_limits = record.get("rate_limits")

@@ -32,9 +32,14 @@ from claude_usage_widget.exhaustion import (
     scan_and_record,
 )
 from claude_usage_widget.rate_limits import (
+    STATUS_AWAITING_REFRESH,
+    STATUS_LAST_KNOWN,
+    STATUS_LIVE,
+    LIVE_THRESHOLD,
     OfficialRateLimitProvider,
     OfficialRateLimits,
     RateLimitWindow,
+    format_age,
     format_reset_time,
     warning_level,
 )
@@ -425,14 +430,34 @@ def test_official_rate_limit_provider() -> None:
             check("overall_level reflects the higher (weekly) figure",
                   result.overall_level == "high", f"got {result.overall_level}")
 
-        stale_payload = dict(fresh_payload)
-        stale_payload["captured_at"] = (
+        # A reading captured a long time ago (well past the old 30-minute
+        # cutoff) must still be returned as-is - there is no age-based
+        # rejection any more (see rate_limits.py module docstring). Per-window
+        # validity is decided separately via RateLimitWindow.status(), tested
+        # in test_window_status_cases() below.
+        old_payload = dict(fresh_payload)
+        old_payload["rate_limits"] = {
+            "five_hour": {
+                "used_percentage": 58,
+                "resets_at": (datetime.now(timezone.utc) + timedelta(hours=2)).timestamp(),
+            },
+            "seven_day": {
+                "used_percentage": 89,
+                "resets_at": (datetime.now(timezone.utc) + timedelta(days=3)).timestamp(),
+            },
+        }
+        old_payload["captured_at"] = (
             datetime.now(timezone.utc) - timedelta(minutes=45)
         ).isoformat()
-        capture_path.write_text(json.dumps(stale_payload), encoding="utf-8")
-        stale_provider = OfficialRateLimitProvider(capture_path=capture_path, max_age=timedelta(minutes=30))
-        check("data older than max_age is treated as unavailable, not shown as current",
-              stale_provider.fetch() is None)
+        capture_path.write_text(json.dumps(old_payload), encoding="utf-8")
+        old_provider = OfficialRateLimitProvider(capture_path=capture_path)
+        old_result = old_provider.fetch()
+        check("a reading 45 minutes old is still returned, not discarded",
+              old_result is not None)
+        if old_result is not None:
+            check("its percentage is still the last known value",
+                  old_result.five_hour.rounded_percentage == 58,
+                  f"got {old_result.five_hour.rounded_percentage}")
 
         # A BOM prepended by some invocation paths (observed via a PowerShell
         # pipe into a native exe) must not break parsing.
@@ -454,6 +479,139 @@ def test_official_rate_limit_provider() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+class _FakeOfficialProvider:
+    """Test double for OfficialRateLimitProvider - avoids depending on
+    (or being thrown off by) this machine's real, live capture file."""
+    name = "fake_official"
+
+    def __init__(self) -> None:
+        self.result: Optional[OfficialRateLimits] = None
+
+    def fetch(self) -> Optional[OfficialRateLimits]:
+        return self.result
+
+
+def test_window_status_cases() -> None:
+    """'Last Known Official Data' regression cases from the redesign: each
+    window's own resets_at - not a fixed capture-age cutoff - decides whether
+    its last known reading is still shown."""
+    print("Last Known Official Data - Cases A/B/C/D")
+
+    now = datetime.now(timezone.utc)
+    captured_30m_ago = now - timedelta(minutes=30)
+
+    # ---- Case A: neither window has reset yet -> both LAST KNOWN ----
+    five_hour_a = RateLimitWindow(used_percentage=58, resets_at=now + timedelta(hours=1))
+    seven_day_a = RateLimitWindow(used_percentage=89, resets_at=now + timedelta(days=2))
+    reading_a = OfficialRateLimits(five_hour=five_hour_a, seven_day=seven_day_a, captured_at=captured_30m_ago)
+    check("Case A: 5H not yet reset -> LAST_KNOWN",
+          reading_a.five_hour_status(now) == STATUS_LAST_KNOWN,
+          f"got {reading_a.five_hour_status(now)!r}")
+    check("Case A: Weekly not yet reset -> LAST_KNOWN",
+          reading_a.seven_day_status(now) == STATUS_LAST_KNOWN,
+          f"got {reading_a.seven_day_status(now)!r}")
+
+    # ---- LIVE vs LAST_KNOWN boundary at LIVE_THRESHOLD ----
+    just_inside_live = RateLimitWindow(used_percentage=1, resets_at=now + timedelta(hours=1))
+    just_outside_live = RateLimitWindow(used_percentage=1, resets_at=now + timedelta(hours=1))
+    check("captured just under LIVE_THRESHOLD -> LIVE",
+          just_inside_live.status(now - LIVE_THRESHOLD + timedelta(seconds=1), now) == STATUS_LIVE)
+    check("captured just over LIVE_THRESHOLD -> LAST_KNOWN",
+          just_outside_live.status(now - LIVE_THRESHOLD - timedelta(seconds=1), now) == STATUS_LAST_KNOWN)
+
+    # ---- Case B: 5H has reset, Weekly has not ----
+    five_hour_b = RateLimitWindow(used_percentage=58, resets_at=now - timedelta(minutes=5))
+    seven_day_b = RateLimitWindow(used_percentage=89, resets_at=now + timedelta(days=2))
+    reading_b = OfficialRateLimits(five_hour=five_hour_b, seven_day=seven_day_b, captured_at=captured_30m_ago)
+    check("Case B: 5H reset already passed -> AWAITING_REFRESH",
+          reading_b.five_hour_status(now) == STATUS_AWAITING_REFRESH,
+          f"got {reading_b.five_hour_status(now)!r}")
+    check("Case B: Weekly reset not yet passed -> LAST_KNOWN, independent of 5H",
+          reading_b.seven_day_status(now) == STATUS_LAST_KNOWN,
+          f"got {reading_b.seven_day_status(now)!r}")
+
+    # ---- Case C: both windows have reset ----
+    five_hour_c = RateLimitWindow(used_percentage=58, resets_at=now - timedelta(minutes=5))
+    seven_day_c = RateLimitWindow(used_percentage=89, resets_at=now - timedelta(hours=1))
+    reading_c = OfficialRateLimits(five_hour=five_hour_c, seven_day=seven_day_c, captured_at=captured_30m_ago)
+    check("Case C: 5H -> AWAITING_REFRESH", reading_c.five_hour_status(now) == STATUS_AWAITING_REFRESH)
+    check("Case C: Weekly -> AWAITING_REFRESH", reading_c.seven_day_status(now) == STATUS_AWAITING_REFRESH)
+
+    # ---- Case D: no official reading has ever been captured ----
+    missing_provider = OfficialRateLimitProvider(capture_path=Path(tempfile.mkdtemp()) / "does-not-exist.json")
+    check("Case D: no capture file at all -> fetch() is None (HistoricalEstimateProvider is allowed to run)",
+          missing_provider.fetch() is None)
+
+    # ---- Same cases, rendered through the actual widget UI ----
+    widget_scratch = Path(tempfile.mkdtemp(prefix="usage_widget_selftest_status_"))
+    fake_official = _FakeOfficialProvider()
+    widget = UsageWidget(
+        provider=MockUsageProvider(),
+        store=_test_store(),
+        exhaustion_store=ExhaustionStore(path=widget_scratch / "store.json"),
+        projects_dir=widget_scratch / "does-not-exist",
+        official_provider=fake_official,
+    )
+    widget.show()
+    QTest.qWait(50)
+
+    fake_official.result = reading_a
+    widget.refresh()
+    check("Case A UI: 5H shows the last known 58%",
+          widget._five_hour_pct_label.text() == "58%", f"got {widget._five_hour_pct_label.text()!r}")
+    check("Case A UI: 5H badge reads LAST KNOWN",
+          widget._five_hour_badge.text() == "OFFICIAL · LAST KNOWN",
+          f"got {widget._five_hour_badge.text()!r}")
+    check("Case A UI: Weekly shows the last known 89%",
+          widget._seven_day_pct_label.text() == "89%", f"got {widget._seven_day_pct_label.text()!r}")
+    check("Case A UI: Weekly badge reads LAST KNOWN",
+          widget._seven_day_badge.text() == "OFFICIAL · LAST KNOWN",
+          f"got {widget._seven_day_badge.text()!r}")
+
+    fake_official.result = reading_b
+    widget.refresh()
+    check("Case B UI: 5H shows AWAITING REFRESH, not the stale 58% or a fake 0%",
+          widget._five_hour_pct_label.text() == "AWAITING REFRESH",
+          f"got {widget._five_hour_pct_label.text()!r}")
+    check("Case B UI: 5H reset line explains a new window started",
+          widget._five_hour_reset_label.text() == "New window started",
+          f"got {widget._five_hour_reset_label.text()!r}")
+    check("Case B UI: Weekly is unaffected and still shows its last known 89%",
+          widget._seven_day_pct_label.text() == "89%", f"got {widget._seven_day_pct_label.text()!r}")
+    check("Case B UI: Weekly badge stays LAST KNOWN",
+          widget._seven_day_badge.text() == "OFFICIAL · LAST KNOWN",
+          f"got {widget._seven_day_badge.text()!r}")
+
+    fake_official.result = reading_c
+    widget.refresh()
+    check("Case C UI: 5H shows AWAITING REFRESH",
+          widget._five_hour_pct_label.text() == "AWAITING REFRESH",
+          f"got {widget._five_hour_pct_label.text()!r}")
+    check("Case C UI: Weekly also shows AWAITING REFRESH",
+          widget._seven_day_pct_label.text() == "AWAITING REFRESH",
+          f"got {widget._seven_day_pct_label.text()!r}")
+    check("Case C UI: neither window fabricates an 'ESTIMATED ~0%' reading",
+          "~" not in widget._five_hour_pct_label.text() and "~" not in widget._seven_day_pct_label.text())
+    check("Case C UI: badges do not say ESTIMATED (official history still exists, just awaiting refresh)",
+          widget._five_hour_badge.text() != "ESTIMATED" and widget._seven_day_badge.text() != "ESTIMATED")
+
+    widget.close()
+    shutil.rmtree(widget_scratch, ignore_errors=True)
+
+
+def test_format_age() -> None:
+    print("format_age")
+    now = datetime(2026, 8, 17, 10, 0, 0, tzinfo=timezone.utc)
+    check("under a minute reads 'just now'",
+          format_age(now - timedelta(seconds=30), now=now) == "just now",
+          f"got {format_age(now - timedelta(seconds=30), now=now)!r}")
+    check("minutes-only format", format_age(now - timedelta(minutes=30), now=now) == "30m ago",
+          f"got {format_age(now - timedelta(minutes=30), now=now)!r}")
+    check("hours + minutes format",
+          format_age(now - timedelta(hours=2, minutes=13), now=now) == "2h 13m ago",
+          f"got {format_age(now - timedelta(hours=2, minutes=13), now=now)!r}")
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setOrganizationName(ORGANISATION)
@@ -463,6 +621,8 @@ def main() -> int:
     test_warning_levels()
     test_rate_limit_window_rounding_and_reset()
     test_official_rate_limit_provider()
+    test_window_status_cases()
+    test_format_age()
     test_local_transcript_provider()
     test_fresh_vs_cached_split()
     test_exhaustion_detection_and_window_stats()
@@ -475,17 +635,6 @@ def main() -> int:
     check("fetch returns a snapshot", snap is not None)
     check("total_tokens non-negative", snap.total_tokens >= 0, f"got {snap.total_tokens}")
     check("badge marks mock data", snap.badge_text == "MOCK")
-
-    class _FakeOfficialProvider:
-        """Test double for OfficialRateLimitProvider - avoids depending on
-        (or being thrown off by) this machine's real, live capture file."""
-        name = "fake_official"
-
-        def __init__(self) -> None:
-            self.result: Optional[OfficialRateLimits] = None
-
-        def fetch(self) -> Optional[OfficialRateLimits]:
-            return self.result
 
     print("widget - no official data, no exhaustion history")
     store = _test_store()
@@ -558,8 +707,8 @@ def main() -> int:
     check("5H reset label also shows a countdown to reset",
           "left" in widget._five_hour_reset_label.text(),
           f"got {widget._five_hour_reset_label.text()!r}")
-    check("5H badge says OFFICIAL",
-          widget._five_hour_badge.isVisible() and widget._five_hour_badge.text() == "OFFICIAL")
+    check("5H badge says OFFICIAL - LIVE (captured just now)",
+          widget._five_hour_badge.isVisible() and widget._five_hour_badge.text() == "OFFICIAL · LIVE")
     check("Weekly shows 89%", widget._seven_day_pct_label.text() == "89%",
           f"got {widget._seven_day_pct_label.text()!r}")
     check("Weekly reset label shows Taipei clock time",
@@ -568,8 +717,8 @@ def main() -> int:
     check("Weekly reset label also shows a countdown to reset",
           "left" in widget._seven_day_reset_label.text(),
           f"got {widget._seven_day_reset_label.text()!r}")
-    check("Weekly badge says OFFICIAL",
-          widget._seven_day_badge.isVisible() and widget._seven_day_badge.text() == "OFFICIAL")
+    check("Weekly badge says OFFICIAL - LIVE (captured just now)",
+          widget._seven_day_badge.isVisible() and widget._seven_day_badge.text() == "OFFICIAL · LIVE")
     check("estimated-only 'Estimated Used' presentation does not appear once official data exists",
           "~" not in widget._five_hour_pct_label.text() and "~" not in widget._seven_day_pct_label.text())
 
