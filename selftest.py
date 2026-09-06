@@ -43,6 +43,7 @@ from claude_usage_widget.rate_limits import (
     format_reset_time,
     warning_level,
 )
+from claude_usage_widget import statusline_hook
 from claude_usage_widget.settings_store import (
     APPLICATION,
     ORGANISATION,
@@ -479,6 +480,117 @@ def test_official_rate_limit_provider() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_statusline_hook_last_good_snapshot() -> None:
+    """official_rate_limits.json must behave as a LAST-GOOD SNAPSHOT: a
+    statusLine render with no usable rate_limits must never clobber the
+    previous good reading (Cases E/F/G), a render with a genuinely new
+    reading must still update normally (Case H), and a first-ever render
+    with nothing usable must not fabricate a file at all (Case I)."""
+    print("statusline_hook - last-good-snapshot behaviour (Cases E/F/G/H/I)")
+
+    tmp = Path(tempfile.mkdtemp(prefix="usage_widget_selftest_hook_"))
+    try:
+        capture_path = tmp / "official_rate_limits.json"
+        log_path = tmp / "statusline_hook.log"
+
+        good_payload = json.dumps({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 29, "resets_at": 1788081000},
+                "seven_day": {"used_percentage": 63, "resets_at": 1788152400},
+            },
+        })
+        statusline_hook._process(good_payload, capture_path=capture_path, log_path=log_path)
+        first_write = json.loads(capture_path.read_text(encoding="utf-8"))
+        check("initial valid render writes the capture file",
+              first_write["rate_limits"]["five_hour"]["used_percentage"] == 29)
+        captured_at_after_good = first_write["captured_at"]
+
+        # ---- Case E: next render has no rate_limits key at all ----
+        no_key_payload = json.dumps({"model": {"display_name": "Claude"}})
+        statusline_hook._process(no_key_payload, capture_path=capture_path, log_path=log_path)
+        after_e = json.loads(capture_path.read_text(encoding="utf-8"))
+        check("Case E: 5H/Weekly values survive a render with no rate_limits key",
+              after_e["rate_limits"]["five_hour"]["used_percentage"] == 29
+              and after_e["rate_limits"]["seven_day"]["used_percentage"] == 63,
+              f"got {after_e['rate_limits']!r}")
+        check("Case E: captured_at is untouched", after_e["captured_at"] == captured_at_after_good,
+              f"got {after_e['captured_at']!r}")
+
+        # ---- Case F: rate_limits explicitly null ----
+        null_payload = json.dumps({"rate_limits": None})
+        statusline_hook._process(null_payload, capture_path=capture_path, log_path=log_path)
+        after_f = json.loads(capture_path.read_text(encoding="utf-8"))
+        check("Case F: rate_limits=null does not overwrite the last good reading",
+              after_f == after_e, f"got {after_f!r}")
+
+        # ---- Case G: rate_limits is an empty object ----
+        empty_payload = json.dumps({"rate_limits": {}})
+        statusline_hook._process(empty_payload, capture_path=capture_path, log_path=log_path)
+        after_g = json.loads(capture_path.read_text(encoding="utf-8"))
+        check("Case G: rate_limits={} does not overwrite the last good reading",
+              after_g == after_f, f"got {after_g!r}")
+
+        # A partial reading (only one window present/valid) must be rejected
+        # the same way - this is the second variant of the bug found during
+        # root-cause investigation, not explicitly one of E/F/G but covered
+        # by the same fix.
+        partial_payload = json.dumps({
+            "rate_limits": {"five_hour": {"used_percentage": 40, "resets_at": 1788081000}},
+        })
+        statusline_hook._process(partial_payload, capture_path=capture_path, log_path=log_path)
+        after_partial = json.loads(capture_path.read_text(encoding="utf-8"))
+        check("a reading with only one valid window does not overwrite the last good reading",
+              after_partial == after_g, f"got {after_partial!r}")
+
+        # ---- Case H: a genuinely new, fully valid reading ----
+        new_payload = json.dumps({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 35, "resets_at": 1788081000},
+                "seven_day": {"used_percentage": 65, "resets_at": 1788152400},
+            },
+        })
+        statusline_hook._process(new_payload, capture_path=capture_path, log_path=log_path)
+        after_h = json.loads(capture_path.read_text(encoding="utf-8"))
+        check("Case H: a new valid reading updates the percentages",
+              after_h["rate_limits"]["five_hour"]["used_percentage"] == 35
+              and after_h["rate_limits"]["seven_day"]["used_percentage"] == 65,
+              f"got {after_h['rate_limits']!r}")
+        check("Case H: captured_at advances for a genuinely new reading",
+              after_h["captured_at"] != captured_at_after_good,
+              f"got {after_h['captured_at']!r}")
+
+        # ---- Case I: first-ever render has nothing usable ----
+        fresh_capture_path = tmp / "never_written.json"
+        fresh_log_path = tmp / "never_written.log"
+        statusline_hook._process(no_key_payload, capture_path=fresh_capture_path, log_path=fresh_log_path)
+        check("Case I: no file is fabricated when nothing has ever been captured",
+              not fresh_capture_path.exists())
+
+        # ---- diagnostic log sanity check ----
+        # One entry per _process() call against `log_path` above, in order:
+        # good, Case E, Case F, Case G, partial-window, Case H.
+        log_lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line]
+        check("diagnostic log recorded one entry per _process() call",
+              len(log_lines) == 6, f"got {len(log_lines)} entries")
+        check("log entries never carry payload/prompt content, only rate_limits metadata",
+              all(set(entry) == {
+                  "timestamp", "has_rate_limits", "five_hour_present", "seven_day_present",
+                  "five_hour_valid", "seven_day_valid", "wrote", "skip_reason",
+                  "file_existed_before", "file_exists_after",
+              } for entry in log_lines))
+        check("Case E's log entry recorded a skip reason and did not write",
+              log_lines[1]["wrote"] is False and log_lines[1]["skip_reason"] == "no_rate_limits_object",
+              f"got {log_lines[1]!r}")
+        check("the partial-window render's log entry recorded a skip reason and did not write",
+              log_lines[4]["wrote"] is False and log_lines[4]["skip_reason"] == "seven_day_missing_or_invalid",
+              f"got {log_lines[4]!r}")
+        check("Case H's log entry recorded a write",
+              log_lines[5]["wrote"] is True and log_lines[5]["skip_reason"] == "",
+              f"got {log_lines[5]!r}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 class _FakeOfficialProvider:
     """Test double for OfficialRateLimitProvider - avoids depending on
     (or being thrown off by) this machine's real, live capture file."""
@@ -621,6 +733,7 @@ def main() -> int:
     test_warning_levels()
     test_rate_limit_window_rounding_and_reset()
     test_official_rate_limit_provider()
+    test_statusline_hook_last_good_snapshot()
     test_window_status_cases()
     test_format_age()
     test_local_transcript_provider()
@@ -770,12 +883,16 @@ def main() -> int:
     widget2.close()
 
     print("always-on-top toggle")
+    # Checked via _is_always_on_top() (the real OS-level topmost state), not
+    # windowFlags() - while shown on Windows this now goes through a direct
+    # SetWindowPos call rather than Qt's flag-recreate path (see
+    # _set_always_on_top's docstring), specifically to avoid a visible
+    # flicker on every toggle, so Qt's own cached flag no longer follows it.
     widget._on_top_box.setChecked(True)
-    check("flag set when enabled", bool(widget.windowFlags() & Qt.WindowStaysOnTopHint))
-    check("still visible after flag change", widget.isVisible())
+    check("on-top set when enabled", widget._is_always_on_top())
+    check("still visible after toggling on", widget.isVisible())
     widget._on_top_box.setChecked(False)
-    check("flag cleared when disabled",
-          not (widget.windowFlags() & Qt.WindowStaysOnTopHint))
+    check("on-top cleared when disabled", not widget._is_always_on_top())
     check("still visible after clearing", widget.isVisible())
 
     print("opacity slider")

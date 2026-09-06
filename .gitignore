@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 launcher/*.exe
+
+# Demo build scratch space - the rendered PNG frame sequence and extracted
+# preview frames are large, disposable working files, not deliverables. The
+# finished clip lives under docs/assets/ instead (see scripts/demo/compose_video.py).
+scripts/demo/render/
+scripts/demo/frames/

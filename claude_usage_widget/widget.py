@@ -79,6 +79,41 @@ WIN_VK_U = 0x55
 WIN_WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
 
+# Toggling Qt.WindowStaysOnTopHint via QWidget.setWindowFlag() makes Qt
+# destroy and recreate the native window on Windows to apply it, which means
+# a hide/show cycle - visible as a flicker - every time the "Always on top"
+# checkbox is toggled while the widget is already shown. The actual OS-level
+# state that flag controls is just the WS_EX_TOPMOST extended window style,
+# which can be changed directly via SetWindowPos without ever hiding the
+# window - see _set_always_on_top().
+WIN_GWL_EXSTYLE = -20
+WIN_WS_EX_TOPMOST = 0x00000008
+WIN_HWND_TOPMOST = -1
+WIN_HWND_NOTOPMOST = -2
+WIN_SWP_NOMOVE = 0x0002
+WIN_SWP_NOSIZE = 0x0001
+WIN_SWP_NOACTIVATE = 0x0010
+
+
+def _configured_user32():
+    """ctypes.windll.user32 with SetWindowPos/GetWindowLongPtrW argtypes
+    declared explicitly. Without this, ctypes marshals every argument as a
+    32-bit c_int by default - which silently truncates the HWND itself and
+    the HWND_TOPMOST/HWND_NOTOPMOST sentinel values on 64-bit Windows,
+    making SetWindowPos a silent no-op (it returns 0/false, no exception) and
+    GetWindowLongPtrW read back the wrong bits entirely."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = ctypes.c_bool
+    user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_longlong
+    return user32
+
 
 class _HotkeyEventFilter(QAbstractNativeEventFilter):
     """Native filter that catches this process's own WM_HOTKEY message.
@@ -565,13 +600,40 @@ class UsageWidget(QWidget):
         self._set_always_on_top(enabled)
 
     def _set_always_on_top(self, enabled: bool) -> None:
-        # Changing this flag recreates the native window, so it must be shown
-        # again - and only if it was already visible, or we would pop up a
-        # window during construction.
+        # While the window is already visible, go straight to the Win32 API
+        # (see WIN_* constants above) instead of QWidget.setWindowFlag() -
+        # that avoids the native-window recreation (and resulting visible
+        # flicker) Qt's own flag-change path causes on Windows. Before the
+        # first show() (e.g. restoring saved state during __init__), there
+        # is nothing on screen to flicker, so the plain Qt path there is both
+        # simpler and keeps windowFlags() correct for that initial paint.
+        if sys.platform == "win32" and self.isVisible():
+            import ctypes
+
+            user32 = _configured_user32()
+            insert_after = WIN_HWND_TOPMOST if enabled else WIN_HWND_NOTOPMOST
+            user32.SetWindowPos(
+                ctypes.c_void_p(int(self.winId())), ctypes.c_void_p(insert_after), 0, 0, 0, 0,
+                WIN_SWP_NOMOVE | WIN_SWP_NOSIZE | WIN_SWP_NOACTIVATE,
+            )
+            return
+
         was_visible = self.isVisible()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
         if was_visible:
             self.show()
+
+    def _is_always_on_top(self) -> bool:
+        """The actual OS-level topmost state - see _set_always_on_top() for
+        why this can't just be `windowFlags() & Qt.WindowStaysOnTopHint`
+        once the widget has been shown at least once on Windows."""
+        if sys.platform == "win32" and self.isVisible():
+            import ctypes
+
+            user32 = _configured_user32()
+            ex_style = user32.GetWindowLongPtrW(ctypes.c_void_p(int(self.winId())), WIN_GWL_EXSTYLE)
+            return bool(ex_style & WIN_WS_EX_TOPMOST)
+        return bool(self.windowFlags() & Qt.WindowStaysOnTopHint)
 
     # ---------- dragging ----------
 
