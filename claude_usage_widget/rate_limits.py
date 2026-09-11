@@ -33,10 +33,19 @@ being old), and each window's own `resets_at` - not a fixed clock timeout -
 decides whether that reading still describes the CURRENT window. A reading
 is still valid to show as-is for as long as `resets_at` hasn't passed yet,
 however long ago it was captured; once `resets_at` passes, that number
-belongs to a window that is already over, so it is replaced by an explicit
-"awaiting refresh" state rather than either the stale percentage or a fake
-zero. five_hour and seven_day reset at different times, so this is decided
-per window, not for the reading as a whole.
+belongs to a window that is already over, so it is labelled accordingly
+rather than either presented as current or replaced by a fake zero.
+five_hour and seven_day reset at different times, so this is decided per
+window, not for the reading as a whole.
+
+REVISED (2026-09-11): once `resets_at` passes, the last known percentage is
+now kept on screen (not blanked out) - the earlier "awaiting refresh" state
+used to hide the number entirely, which meant a long-idle 5H window went
+blank exactly when a quiet gap made that number most worth keeping visible.
+STATUS_LAST_KNOWN_EXPIRED (formerly STATUS_AWAITING_REFRESH) still means
+the same thing structurally - `now >= resets_at` - but callers are now
+expected to keep showing `used_percentage` alongside it, clearly labelled
+as last-known/stale rather than current, until a fresh capture replaces it.
 """
 
 from __future__ import annotations
@@ -55,10 +64,10 @@ DEFAULT_CAPTURE_PATH = Path.home() / ".claude-usage-widget" / "official_rate_lim
 # purely a display distinction, not a validity cutoff: see module docstring.
 LIVE_THRESHOLD = timedelta(minutes=2)
 
-# Per-window status returned by window_status().
+# Per-window status returned by RateLimitWindow.status().
 STATUS_LIVE = "live"
 STATUS_LAST_KNOWN = "last_known"
-STATUS_AWAITING_REFRESH = "awaiting_refresh"
+STATUS_LAST_KNOWN_EXPIRED = "last_known_expired"
 
 # A fixed UTC+8 offset rather than zoneinfo.ZoneInfo("Asia/Taipei"): Windows
 # Python has no bundled IANA tzdata (ZoneInfo raises ZoneInfoNotFoundError
@@ -86,11 +95,25 @@ def warning_level(percentage: float) -> str:
     return "normal"
 
 
-def format_reset_time(dt: datetime, tz: timezone = TAIPEI) -> str:
-    """'Reset 13:10'-style label in the given timezone (default Asia/Taipei),
-    from an aware UTC datetime. No timestamp, no timezone suffix - the
-    widget's audience is one person in one timezone."""
-    return dt.astimezone(tz).strftime("%H:%M")
+# Fixed English abbreviations rather than strftime's locale-dependent %a -
+# on a non-English Windows locale, %a would render as e.g. "週日" instead of
+# "Sun", which the widget's fixed-width layout isn't built to expect.
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def format_reset_time(dt: datetime, tz: timezone = TAIPEI, include_date: bool = False) -> str:
+    """'13:10'-style label in the given timezone (default Asia/Taipei), from
+    an aware UTC datetime. No timestamp, no timezone suffix - the widget's
+    audience is one person in one timezone.
+
+    With include_date=True, returns 'Sun 09/14 13:10' instead - the 5-hour
+    window resets within the same day often enough that the bare clock time
+    is unambiguous, but a 7-day window's reset can land on a day far enough
+    out that "13:10" alone doesn't say which day."""
+    local = dt.astimezone(tz)
+    if include_date:
+        return f"{_WEEKDAY_ABBR[local.weekday()]} {local:%m/%d %H:%M}"
+    return local.strftime("%H:%M")
 
 
 def format_age(captured_at: datetime, now: Optional[datetime] = None) -> str:
@@ -125,8 +148,8 @@ class RateLimitWindow:
     def level(self) -> str:
         return warning_level(self.used_percentage)
 
-    def reset_label(self, tz: timezone = TAIPEI) -> str:
-        return format_reset_time(self.resets_at, tz)
+    def reset_label(self, tz: timezone = TAIPEI, include_date: bool = False) -> str:
+        return format_reset_time(self.resets_at, tz, include_date=include_date)
 
     def time_until_reset(self, now: Optional[datetime] = None) -> str:
         """'2h 13m' / '45m' style countdown to resets_at. `now` is injectable
@@ -144,10 +167,15 @@ class RateLimitWindow:
     def status(self, captured_at: datetime, now: Optional[datetime] = None) -> str:
         """Whether this window's reading (captured at `captured_at`) still
         describes the CURRENT window, per the per-window resets_at rule
-        described in this module's docstring - not a fixed age cutoff."""
+        described in this module's docstring - not a fixed age cutoff.
+
+        STATUS_LAST_KNOWN_EXPIRED does not mean "discard used_percentage" -
+        it means the window has rolled over and this percentage is now
+        stale; callers still show it, just clearly labelled as such (see
+        widget.py's _render_window)."""
         now = now or datetime.now(timezone.utc)
         if now >= self.resets_at:
-            return STATUS_AWAITING_REFRESH
+            return STATUS_LAST_KNOWN_EXPIRED
         if now - captured_at <= LIVE_THRESHOLD:
             return STATUS_LIVE
         return STATUS_LAST_KNOWN

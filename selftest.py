@@ -32,8 +32,8 @@ from claude_usage_widget.exhaustion import (
     scan_and_record,
 )
 from claude_usage_widget.rate_limits import (
-    STATUS_AWAITING_REFRESH,
     STATUS_LAST_KNOWN,
+    STATUS_LAST_KNOWN_EXPIRED,
     STATUS_LIVE,
     LIVE_THRESHOLD,
     OfficialRateLimitProvider,
@@ -384,6 +384,22 @@ def test_rate_limit_window_rounding_and_reset() -> None:
     check("format_reset_time matches the same conversion",
           format_reset_time(window.resets_at) == "13:10")
 
+    print("RateLimitWindow.reset_label(include_date=True) - Case 1")
+    # 2026-09-14 13:00 Asia/Taipei is actually a Monday (verified via
+    # datetime.strftime - not the "Sun" the request illustrated with), so
+    # this asserts the real weekday rather than copying a wrong example.
+    weekly_window = RateLimitWindow(
+        used_percentage=42,
+        resets_at=datetime(2026, 9, 14, 5, 0, 0, tzinfo=timezone.utc),  # 13:00 Taipei
+    )
+    check("include_date=True adds a fixed-English weekday + MM/DD ahead of HH:MM",
+          weekly_window.reset_label(include_date=True) == "Mon 09/14 13:00",
+          f"got {weekly_window.reset_label(include_date=True)!r}")
+    check("format_reset_time(include_date=True) matches the same conversion",
+          format_reset_time(weekly_window.resets_at, include_date=True) == "Mon 09/14 13:00")
+    check("include_date defaults to False - 5H's plain HH:MM is unaffected",
+          weekly_window.reset_label() == "13:00", f"got {weekly_window.reset_label()!r}")
+
     print("RateLimitWindow.time_until_reset")
     reference = datetime(2026, 8, 17, 10, 0, 0, tzinfo=timezone.utc)
     hours_and_minutes = RateLimitWindow(used_percentage=0, resets_at=reference + timedelta(hours=2, minutes=13))
@@ -635,8 +651,8 @@ def test_window_status_cases() -> None:
     five_hour_b = RateLimitWindow(used_percentage=58, resets_at=now - timedelta(minutes=5))
     seven_day_b = RateLimitWindow(used_percentage=89, resets_at=now + timedelta(days=2))
     reading_b = OfficialRateLimits(five_hour=five_hour_b, seven_day=seven_day_b, captured_at=captured_30m_ago)
-    check("Case B: 5H reset already passed -> AWAITING_REFRESH",
-          reading_b.five_hour_status(now) == STATUS_AWAITING_REFRESH,
+    check("Case B: 5H reset already passed -> LAST_KNOWN_EXPIRED",
+          reading_b.five_hour_status(now) == STATUS_LAST_KNOWN_EXPIRED,
           f"got {reading_b.five_hour_status(now)!r}")
     check("Case B: Weekly reset not yet passed -> LAST_KNOWN, independent of 5H",
           reading_b.seven_day_status(now) == STATUS_LAST_KNOWN,
@@ -646,8 +662,8 @@ def test_window_status_cases() -> None:
     five_hour_c = RateLimitWindow(used_percentage=58, resets_at=now - timedelta(minutes=5))
     seven_day_c = RateLimitWindow(used_percentage=89, resets_at=now - timedelta(hours=1))
     reading_c = OfficialRateLimits(five_hour=five_hour_c, seven_day=seven_day_c, captured_at=captured_30m_ago)
-    check("Case C: 5H -> AWAITING_REFRESH", reading_c.five_hour_status(now) == STATUS_AWAITING_REFRESH)
-    check("Case C: Weekly -> AWAITING_REFRESH", reading_c.seven_day_status(now) == STATUS_AWAITING_REFRESH)
+    check("Case C: 5H -> LAST_KNOWN_EXPIRED", reading_c.five_hour_status(now) == STATUS_LAST_KNOWN_EXPIRED)
+    check("Case C: Weekly -> LAST_KNOWN_EXPIRED", reading_c.seven_day_status(now) == STATUS_LAST_KNOWN_EXPIRED)
 
     # ---- Case D: no official reading has ever been captured ----
     missing_provider = OfficialRateLimitProvider(capture_path=Path(tempfile.mkdtemp()) / "does-not-exist.json")
@@ -682,11 +698,15 @@ def test_window_status_cases() -> None:
 
     fake_official.result = reading_b
     widget.refresh()
-    check("Case B UI: 5H shows AWAITING REFRESH, not the stale 58% or a fake 0%",
-          widget._five_hour_pct_label.text() == "AWAITING REFRESH",
+    check("Case B UI: 5H keeps showing its last known 58% - never blanked, never a fake 0%",
+          widget._five_hour_pct_label.text() == "58%",
           f"got {widget._five_hour_pct_label.text()!r}")
-    check("Case B UI: 5H reset line explains a new window started",
-          widget._five_hour_reset_label.text() == "New window started",
+    check("Case B UI: 5H badge still reads OFFICIAL · LAST KNOWN (not LIVE - this number is stale)",
+          widget._five_hour_badge.text() == "OFFICIAL · LAST KNOWN",
+          f"got {widget._five_hour_badge.text()!r}")
+    check("Case B UI: 5H reset line says awaiting refresh, not a stale/misleading reset time",
+          "Awaiting refresh" in widget._five_hour_reset_label.text()
+          and "Reset" not in widget._five_hour_reset_label.text(),
           f"got {widget._five_hour_reset_label.text()!r}")
     check("Case B UI: Weekly is unaffected and still shows its last known 89%",
           widget._seven_day_pct_label.text() == "89%", f"got {widget._seven_day_pct_label.text()!r}")
@@ -696,16 +716,35 @@ def test_window_status_cases() -> None:
 
     fake_official.result = reading_c
     widget.refresh()
-    check("Case C UI: 5H shows AWAITING REFRESH",
-          widget._five_hour_pct_label.text() == "AWAITING REFRESH",
+    check("Case C UI: 5H still shows its last known 58%",
+          widget._five_hour_pct_label.text() == "58%",
           f"got {widget._five_hour_pct_label.text()!r}")
-    check("Case C UI: Weekly also shows AWAITING REFRESH",
-          widget._seven_day_pct_label.text() == "AWAITING REFRESH",
+    check("Case C UI: Weekly still shows its last known 89%",
+          widget._seven_day_pct_label.text() == "89%",
           f"got {widget._seven_day_pct_label.text()!r}")
+    check("Case C UI: both reset lines say awaiting refresh",
+          "Awaiting refresh" in widget._five_hour_reset_label.text()
+          and "Awaiting refresh" in widget._seven_day_reset_label.text(),
+          f"got {widget._five_hour_reset_label.text()!r} / {widget._seven_day_reset_label.text()!r}")
     check("Case C UI: neither window fabricates an 'ESTIMATED ~0%' reading",
           "~" not in widget._five_hour_pct_label.text() and "~" not in widget._seven_day_pct_label.text())
     check("Case C UI: badges do not say ESTIMATED (official history still exists, just awaiting refresh)",
           widget._five_hour_badge.text() != "ESTIMATED" and widget._seven_day_badge.text() != "ESTIMATED")
+
+    # ---- Case 4: a fresh official capture arrives after LAST_KNOWN_EXPIRED -> back to LIVE ----
+    five_hour_d = RateLimitWindow(used_percentage=3, resets_at=now + timedelta(hours=5))
+    seven_day_d = RateLimitWindow(used_percentage=89, resets_at=now + timedelta(days=2))
+    fake_official.result = OfficialRateLimits(five_hour=five_hour_d, seven_day=seven_day_d, captured_at=now)
+    widget.refresh()
+    check("Case 4: a fresh capture updates 5H to the new percentage",
+          widget._five_hour_pct_label.text() == "3%", f"got {widget._five_hour_pct_label.text()!r}")
+    check("Case 4: 5H badge returns to OFFICIAL · LIVE",
+          widget._five_hour_badge.text() == "OFFICIAL · LIVE",
+          f"got {widget._five_hour_badge.text()!r}")
+    check("Case 4: 5H reset line shows a real reset time again, not 'awaiting refresh'",
+          "Awaiting refresh" not in widget._five_hour_reset_label.text()
+          and "Reset" in widget._five_hour_reset_label.text(),
+          f"got {widget._five_hour_reset_label.text()!r}")
 
     widget.close()
     shutil.rmtree(widget_scratch, ignore_errors=True)
@@ -824,8 +863,8 @@ def main() -> int:
           widget._five_hour_badge.isVisible() and widget._five_hour_badge.text() == "OFFICIAL · LIVE")
     check("Weekly shows 89%", widget._seven_day_pct_label.text() == "89%",
           f"got {widget._seven_day_pct_label.text()!r}")
-    check("Weekly reset label shows Taipei clock time",
-          f"Reset {format_reset_time(seven_day_reset_at)}" in widget._seven_day_reset_label.text(),
+    check("Weekly reset label shows Taipei clock time WITH the weekday+date (5H doesn't need one, Weekly does)",
+          f"Reset {format_reset_time(seven_day_reset_at, include_date=True)}" in widget._seven_day_reset_label.text(),
           f"got {widget._seven_day_reset_label.text()!r}")
     check("Weekly reset label also shows a countdown to reset",
           "left" in widget._seven_day_reset_label.text(),

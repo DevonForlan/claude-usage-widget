@@ -6,8 +6,10 @@ Data priority for the two big percentages (5H / Weekly):
    Claude Code's status line (see rate_limits.py). Used whenever a reading
    has EVER been captured - it is not discarded just because the statusLine
    hook hasn't rendered again recently. Each window (5H / Weekly) is then
-   rendered independently as LIVE, LAST KNOWN, or AWAITING REFRESH depending
-   on whether its own `resets_at` has passed - see rate_limits.py.
+   rendered independently as LIVE, LAST KNOWN, or LAST KNOWN (expired -
+   the window has rolled over, awaiting a fresh capture, but the last known
+   percentage stays on screen rather than being blanked) depending on
+   whether its own `resets_at` has passed - see rate_limits.py.
 2. HistoricalEstimateProvider (EstimatedQuotaModel, exhaustion.py) - only
    consulted when (1) has NEVER produced a reading (statusLine hook never
    configured, or its capture file has never successfully parsed). It only
@@ -43,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from .exhaustion import EstimatedQuota, EstimatedQuotaModel, ExhaustionStore, scan_and_record
 from .rate_limits import (
-    STATUS_AWAITING_REFRESH,
+    STATUS_LAST_KNOWN_EXPIRED,
     STATUS_LIVE,
     OfficialRateLimitProvider,
     OfficialRateLimits,
@@ -158,15 +160,11 @@ WAKE_PORT = 51823
 # Warning-level -> text colour for the big percentage numbers. Each number is
 # coloured by ITS OWN value, independently of the other window - a calm 5H
 # reading should still look calm even if the weekly figure is critical.
-# "awaiting" is not a usage-pressure level (no current percentage exists to
-# judge) - it gets a neutral grey rather than borrowing "normal"'s green,
-# which would misleadingly read as "usage is fine" rather than "unknown".
 _LEVEL_COLORS = {
     "normal": "#3fb950",
     "elevated": "#d29922",
     "high": "#db6d28",
     "critical": "#f85149",
-    "awaiting": "#8b949e",
 }
 
 STYLE = """
@@ -191,10 +189,6 @@ QLabel { color: #c9d1d9; }
 #sourceBadge[kind="last_known"] {
     color: #58a6ff;
     border-color: #58a6ff;
-}
-#sourceBadge[kind="awaiting"] {
-    color: #8b949e;
-    border-color: #8b949e;
 }
 #sourceBadge[kind="estimated"] {
     color: #a371f7;
@@ -469,6 +463,7 @@ class UsageWidget(QWidget):
         self._render_window(
             self._seven_day_badge, self._seven_day_pct_label, self._seven_day_reset_label,
             window=official.seven_day, captured_at=official.captured_at, now=now,
+            include_date=True,
         )
 
     def _render_window(
@@ -480,27 +475,30 @@ class UsageWidget(QWidget):
         window: RateLimitWindow,
         captured_at: datetime,
         now: datetime,
+        include_date: bool = False,
     ) -> None:
         status = window.status(captured_at, now)
-        if status == STATUS_AWAITING_REFRESH:
+        if status == STATUS_LAST_KNOWN_EXPIRED:
             # This window has already reset since the last capture - the old
-            # percentage belongs to a window that is over, and showing it (or
-            # a fake 0%) would misrepresent the new window's actual usage,
-            # which is unknown until the next statusLine render.
+            # percentage no longer describes the CURRENT window, but it is
+            # still the last real reading this account has, so it stays on
+            # screen (never blanked, never faked as 0%) clearly labelled as
+            # stale until a fresh statusLine render replaces it.
             self._set_window_section(
                 badge, pct_label, reset_label,
-                pct_text="AWAITING REFRESH", level="awaiting",
-                reset_text="New window started",
-                badge_text="AWAITING REFRESH", kind="awaiting",
+                pct_text=f"{window.rounded_percentage}%",
+                level=window.level,
+                reset_text=f"Updated {format_age(captured_at, now)} · Awaiting refresh",
+                badge_text="OFFICIAL · LAST KNOWN", kind="last_known",
             )
             return
 
         if status == STATUS_LIVE:
             badge_text, kind = "OFFICIAL · LIVE", "live"
-            reset_text = f"Reset {window.reset_label()} · {window.time_until_reset(now=now)} left"
+            reset_text = f"Reset {window.reset_label(include_date=include_date)} · {window.time_until_reset(now=now)} left"
         else:
             badge_text, kind = "OFFICIAL · LAST KNOWN", "last_known"
-            reset_text = f"Reset {window.reset_label()} · Updated {format_age(captured_at, now)}"
+            reset_text = f"Reset {window.reset_label(include_date=include_date)} · Updated {format_age(captured_at, now)}"
 
         self._set_window_section(
             badge, pct_label, reset_label,
@@ -554,15 +552,11 @@ class UsageWidget(QWidget):
     ) -> None:
         pct_label.setText(pct_text)
         color = _LEVEL_COLORS.get(level, _LEVEL_COLORS["normal"])
-        # Long status text ("AWAITING REFRESH") needs a smaller size than the
-        # normal 2-4 character percentage to avoid overflowing the fixed-width
-        # window.
+        # Long status text (e.g. "--") needs a smaller size than the normal
+        # 2-4 character percentage to avoid overflowing the fixed-width window.
         font_size = 26 if len(pct_text) <= 5 else 13
         pct_label.setStyleSheet(f"color: {color}; font-size: {font_size}px;")
-        pct_label.setToolTip(
-            "New window started - waiting for the next official reading"
-            if level == "awaiting" else f"{level.title()} usage level"
-        )
+        pct_label.setToolTip(f"{level.title()} usage level")
         reset_label.setText(reset_text)
 
         badge.setText(badge_text)
